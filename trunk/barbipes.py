@@ -1,3 +1,4 @@
+#! /usr/bin/env python2.5
 # all database threading code by Wim Schut, copied from here:
 # http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/496799
 
@@ -5,10 +6,14 @@ import sys, os
 import urllib2, threading
 import urlparse
 import sqlite3
+import random
 import Queue, time, thread
 from datetime import datetime, timedelta
 from threading import Thread
 import re
+
+from torvalddj.config import configuration
+from torvalddj.utils import log_stdout, url_to_filename
 
 _threadex = thread.allocate_lock()
 qthreads = 0
@@ -75,26 +80,6 @@ def execSQL(s):
         sqlqueue.put(s)
         return s.resultqueue.get()
 
-## if __name__ == "__main__":
-##     dbname = "test.db"
-##     execSQL(DbCmd(ConnectCmd, dbname))
-##     execSQL(DbCmd(SqlCmd, [("create table people (name_last, age integer);",())]))
-## #   don't add connections before creating table
-##     execSQL(DbCmd(ConnectCmd, dbname))
-## #   insert one row
-##     execSQL(DbCmd(SqlCmd, [("insert into people (name_last, age) values (?, ?);", ('Smith', 80))]))
-## #   insert two rows in one transaction
-##     execSQL(DbCmd(SqlCmd, [("insert into people (name_last, age) values (?, ?);", ('Jones', 55)), 
-##                            ("insert into people (name_last, age) values (?, ?);", ('Gruns', 25))]))
-##     for p in execSQL(DbCmd(SqlCmd, [("select * from people", ())])): print p
-##     execSQL(DbCmd(StopCmd))
-##     os.remove(dbname)
-
-
-def log_stdout(msg):
-    """Print msg to the screen."""
-    print msg
-
 def get_page(url, log):
     """Retrieve URL and return comments, log errors."""
     try:
@@ -145,13 +130,13 @@ def alternate_urls(url):
 def create_db():
     """ Set up the database
     """
-    connection = sqlite3.connect("urls.db")
+    connection = sqlite3.connect(configuration.database)
     cursor = connection.cursor()
     cursor.execute(
-        'CREATE TABLE blog_urls (url VARCHAR(200), updated DATE)')
+        'CREATE TABLE blog_urls (url VARCHAR(200), updated DATE, banned BOOLEAN, score INTEGER)')
     cursor.execute(
         'CREATE TABLE file_urls (blog VARCHAR(200), url VARCHAR(300),'
-        ' downloaded BOOLEAN)')
+        ' downloaded BOOLEAN, invalid BOOLEAN, tagged BOOLEAN, duplicate BOOLEAN, purged BOOLEAN)')
     connection.commit()
 
 
@@ -230,7 +215,7 @@ class Spider(Thread):
          
     def downloaded_file_url(self, url):
         execSQL(DbCmd(SqlCmd,[(
-            "UPDATE file_urls SET downloaded = True WHERE url = ?", (url,))]))
+            "UPDATE file_urls SET downloaded = 1 WHERE url = ?", (url,))]))
 
     def process_url(self, start_url):
         #process list of URLs one at a time
@@ -282,30 +267,27 @@ class Spider(Thread):
             time.sleep(0.1)
 
     def download_file(self, url):
-        print "T%s: %s" % (self.thread, url)
+	url_ascii = url.encode('ascii', 'replace')
+        print "T%s: %s" % (self.thread, url_ascii)
         if not url.startswith("http://") and not url.startswith("https://"):
-            print "T%s: weird link" % self.thread
+            print "T%s: weird link %s" % (self.thread, url_ascii)
             execSQL(DbCmd(
                 SqlCmd,
                 [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
             return
         for alt in alternate_urls(url):
-            if os.path.exists(alt.split('://')[1]):
+            if os.path.exists(url_to_filename(alt)):
                 print "T%s: already there" % self.thread
-                execSQL(DbCmd(
-                    SqlCmd,
-                    [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
+		self.downloaded_file_url(url)
                 return
         try:
             os.popen(
-                'curl -s --max-time 600 --connect-timeout 10 --user-agent'
-                ' "Mozilla/5.0" --create-dirs --globoff --max-filesize'
-                ' 30000000 -o "%s" "%s"' % (urllib2.unquote(url.split('://')[1]), url))
+                u'curl -s --max-time 600 --connect-timeout 10 --user-agent'
+		u' "Mozilla/5.0" --create-dirs --globoff --max-filesize'
+		u' 30000000 -o "%s" "%s"' % (url_to_filename(url), url))
         except:
-            pass       
-        execSQL(DbCmd(
-            SqlCmd,
-            [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
+            pass
+	self.downloaded_file_url(url)
 
 def get_blog_urls():
     week = timedelta(7)
@@ -315,54 +297,154 @@ def get_blog_urls():
     day = last_week.day
     url_tups = execSQL(
         DbCmd(SqlCmd, [
-        ("SELECT url FROM blog_urls WHERE updated < '%04d-%02d-%02d' ORDER BY updated;" % (year, month, day),
+        ("SELECT url FROM blog_urls WHERE updated < '%04d-%02d-%02d' AND banned ISNULL ORDER BY updated;" % (year, month, day),
          ())]))
     result = [tup[0] for tup in url_tups]
     print "%s blogs to harvest" % str(len(result))
     return result
     
 def download_files(n=100):
-    execSQL(DbCmd(ConnectCmd, "urls.db"))
+    """Download some files.
+    """
+    execSQL(DbCmd(ConnectCmd, configuration.database))
     for i in range(threads):
         s = Spider(urlqueue, 'download', str(i))
         s.setDaemon(True)
         s.start()
-    for row in execSQL(DbCmd(
+    all_files = execSQL(DbCmd(
         SqlCmd,
-        [("SELECT url FROM file_urls WHERE downloaded = ?;", (False,))]))[:n]:
+        [("SELECT url FROM file_urls WHERE downloaded = ?;", (False,))]))
+    random.shuffle(all_files)
+    for row in all_files[:n]:
         urlqueue.put(row[0])
     urlqueue.join()
     execSQL(DbCmd(StopCmd))
+
+def check_files(fix=False, invalidate=False):
+    """Check that all files have been downloaded.
+    """
+    connection = sqlite3.connect(configuration.database)
+    cursor = connection.cursor()
+    cursor.execute("SELECT url FROM file_urls WHERE downloaded = 1 AND invalid ISNULL")
+    missing = 0
+    for entry in cursor.fetchall():
+	url = entry[0]
+	filename = url_to_filename(url)
+	if not os.path.exists(filename):
+	    log_stdout(u"Missing file %s - url %s" % (filename, url))
+	    missing += 1
+	    if fix:
+		cursor.execute("UPDATE file_urls SET downloaded = 0 WHERE url = ?", (url,))
+	    elif invalidate:
+		cursor.execute("UPDATE file_urls SET invalid = 0 WHERE url = ?", (url,))
+    log_stdout("%d missing files." % missing)
+    if fix or invalidate:
+	connection.commit()
+    connection.close()
+
+def clean_files():
+    """Delete invalid files.
+    """
+    connection = sqlite3.connect(configuration.database)
+    cursor = connection.cursor()
+    cursor.execute("SELECT url FROM file_urls WHERE invalid = 1 AND purged ISNULL")
+    purged = 0
+    for entry in cursor.fetchall():
+	url = entry[0]
+	filename = url_to_filename(url)
+	try:
+	    if os.path.exists(filename):
+		os.remove(filename)
+	    cursor.execute("UPDATE file_urls SET purged = 1 WHERE url = ?", (url,))
+	    purged += 1
+	    os.removedirs(os.path.dirname(filename))
+	except OSError:
+	    pass
+    log_stdout("%d files purged." % purged)
+    connection.commit()
+    connection.close()
         
-def add(url):
-    print "adding %s" % url
-    connection = sqlite3.connect("urls.db")
+def add_blog(url):
+    """Add a blog if it's not already exists.
+    """
+    log_stdout("adding %s" % url)
+    connection = sqlite3.connect(configuration.database)
     cursor = connection.cursor()
     cursor.execute(
         "SELECT * FROM blog_urls WHERE url = ?", (url,))
     row = cursor.fetchone()
     if row:
-        print "blog already added"
+        log_stdout("blog already added")
         return
-    cursor.execute("INSERT INTO blog_urls (url) VALUES"
-                   "(?)", (url,))
+    cursor.execute("INSERT INTO blog_urls (url, updated) VALUES"
+                   "(?, '2001-01-01')", (url,))
     connection.commit()
+    connection.close()
+
+def list_blogs():
+    connection = sqlite3.connect(configuration.database)
+    cursor = connection.cursor()
+    cursor.execute("SELECT b.url, (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog = b.url), (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog = b.url AND f.invalid = 1 AND f.duplicate ISNULL), (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog = b.url AND f.invalid ISNULL AND f.downloaded = 1 AND f.tagged ISNULL) FROM blog_urls AS b")
+    entries = cursor.fetchall()
+    for entry in entries:
+	url, nb_file, nb_invalid, nb_notagged = entry
+	display = u'blog - %s, files - %d' % (url, nb_file,)
+	flags = U''
+	if nb_notagged:
+	    flags += u'+'
+	    display += u'\n   no tag  - % 3d / % 3d%%' % \
+		       (nb_notagged, (nb_notagged * 100.0) / nb_file)
+	else:
+	    flags += u' '
+	if nb_invalid:
+	    flags += u'*'
+	    display += u'\n   invalid - % 3d / % 3d%%' % \
+		       (nb_invalid, (nb_invalid * 100.0) / nb_file)
+	else:
+	    flags += u' '
+	log_stdout(flags + display)
+    log_stdout("%d blogs." % len(entries))
+    cursor.execute("SELECT COUNT(*) FROM file_urls")
+    total_file = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM file_urls WHERE downloaded = 1")
+    downloaded_file = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM file_urls WHERE invalid = 1")
+    invalid_file = cursor.fetchone()
+    log_stdout("%s files, %s downloaded, %s invalids." %
+	       (total_file[0], downloaded_file[0], invalid_file[0]))
+    cursor.execute("SELECT COUNT(*) FROM file_urls WHERE tagged = 1")
+    valid_file = cursor.fetchone()
+    log_stdout("%s valid files may have been found." % valid_file[0])
+    connection.close()
+
+def delete_blog(url):
+    """Delete a blog.
+    """
+    connection = sqlite3.connect(configuration.database)
+    cursor = connection.cursor()
+    cursor.execute("DELETE FROM blog_urls WHERE url = ?", (url,))
+    connection.commit()
+    connection.close()
 
 def undo():
-    connection = sqlite3.connect("urls.db")
+    """Un-download a file.
+    """
+    connection = sqlite3.connect(configuration.database)
     cursor = connection.cursor()
     undos = open("undo.txt", "r")
     for undo in undos.readlines():
         cursor.execute(
             "UPDATE file_urls SET downloaded = 0 WHERE url = ?",
             ("http://" + undo.strip(),))
-        print undo.strip()
+        log_stdout(undo.strip())
         connection.commit()
     undos.close()
     connection.close()
 
 def spider(depth=1):
-    execSQL(DbCmd(ConnectCmd, "urls.db"))
+    """Search for URLs.
+    """
+    execSQL(DbCmd(ConnectCmd, configuration.database))
     for i in range(threads):
         s = Spider(urlqueue, 'spider', str(i), max_depth=depth)
         s.setDaemon(True)
@@ -375,16 +457,32 @@ def spider(depth=1):
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         spider()
-    if sys.argv[1] == 'quick':
+    elif sys.argv[1] == 'quick':
         spider(depth=0)
-    if sys.argv[1] == 'download':
+    elif sys.argv[1] == 'download':
         if len(sys.argv) > 2:
             download_files(int(sys.argv[2]))
         else:
             download_files()
-    if sys.argv[1] == 'createdb':
+    elif sys.argv[1] == 'createdb':
         create_db()
-    if sys.argv[1] == 'add':
-        add(sys.argv[2])
-    if sys.argv[1] == 'undo':
+    elif sys.argv[1] == 'add':
+        add_blog(sys.argv[2])
+    elif sys.argv[1] == 'delete':
+	delete_blog(sys.argv[2])
+    elif sys.argv[1] == 'list':
+	list_blogs()
+    elif sys.argv[1] == 'check':
+	fix = False
+	invalidate = False
+	if len(sys.argv) == 3:
+	    if sys.argv[2] == 'fix':
+		fix = True
+	    elif sys.argv[2] == 'invalidate':
+		invalidate = True
+	check_files(fix, invalidate)
+    elif sys.argv[1] == 'undo':
         undo()
+    elif sys.argv[1] == 'clean':
+	clean_files()
+	

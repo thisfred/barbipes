@@ -1,0 +1,7 @@
+[main]
+player = itunes
+database = urls.db
+repository = /Volumes/Goinfre/Mp3
+
+[analyze]
+destination = /Volumes/Goinfre/Mp3 Clean
