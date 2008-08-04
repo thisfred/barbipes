@@ -27,13 +27,22 @@ def compute_md5sum(filename):
     f.close()
     return hash.hexdigest()
 
+
 def hash_name(name):
     """Give a hash for the given name.
     """
-    letter = name[0]
-    if letter.isalpha():
-	return letter.upper()
-    return '0-9'
+    if name[0].isalpha():
+	value = name[0].upper()
+    else:
+	value = '0-9'
+
+    if len(name) > 1:
+	if name[1].isalpha():
+	    value = os.path.join(value, value + name[1].lower())
+	else:
+	    value = os.path.join(value, value + '_0-9')
+    return value
+
 
 def get_metadata(metadata, key):
     """Return metadata entry for key.
