@@ -43,7 +43,6 @@ def hash_name(name):
 	    value = os.path.join(value, value + '_0-9')
     return value
 
-
 def get_metadata(metadata, key):
     """Return metadata entry for key.
     """
@@ -56,7 +55,7 @@ def get_metadata(metadata, key):
 def order_files():
     connection = sqlite3.connect(configuration.database)
     cursor = connection.cursor()
-    cursor.execute("SELECT url FROM file_urls WHERE downloaded = 1 AND invalid ISNULL AND tagged ISNULL")
+    cursor.execute("SELECT url, file_id FROM file_urls WHERE downloaded = 1 AND invalid ISNULL AND tagged ISNULL")
     added_files = 0
     invalids = 0
     invalids_mime = 0
@@ -145,7 +144,12 @@ def order_files():
     connection.close()
 
 def create_db():
-    pass
+    connection = sqlite3.connect(configuration.database)
+    cursor = connection.cursor()
+    cursor.execute(
+        'CREATE TABLE songs (song_id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER, title VARCHAR(250), artist VARCHAR(150), album VARCHAR(150), score INTEGER)')
+    connection.commit()
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 2 or sys.argv[1] == 'analyze':

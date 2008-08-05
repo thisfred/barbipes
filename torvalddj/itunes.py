@@ -10,6 +10,6 @@ class Player(object):
 	self.player = appscript.app('iTunes.app')
 
     def add(self, filename):
-	itunes.add(mactypes.Alias(filename))
+	self.player.add(mactypes.Alias(filename))
 
     
