@@ -133,10 +133,11 @@ def create_db():
     connection = sqlite3.connect(configuration.database)
     cursor = connection.cursor()
     cursor.execute(
-        'CREATE TABLE blog_urls (url VARCHAR(200), updated DATE, banned BOOLEAN, score INTEGER)')
+        'CREATE TABLE blog_urls (blog_id INTEGER PRIMARY KEY AUTOINCREMENT, title VARCHAR(200), url VARCHAR(200), updated DATE, last_seen DATE, banned BOOLEAN, score INTEGER)')
     cursor.execute(
-        'CREATE TABLE file_urls (blog VARCHAR(200), url VARCHAR(300),'
-        ' downloaded BOOLEAN, invalid BOOLEAN, tagged BOOLEAN, duplicate BOOLEAN, purged BOOLEAN)')
+        'CREATE TABLE file_urls (file_id INTEGER PRIMARY KEY AUTOINCREMENT, blog_id INTEGER, url VARCHAR(300), downloaded BOOLEAN, invalid BOOLEAN, tagged BOOLEAN, duplicate BOOLEAN, purged BOOLEAN)')
+    cursor.execute(
+	'CREATE VIEW blog_stats AS SELECT b.url AS url, (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog_id = b.blog_id) AS total, (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog_id = b.blog_id AND f.invalid = 1 AND f.duplicate ISNULL) AS invalid, (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog_id = b.blog_id AND f.invalid ISNULL AND f.downloaded = 1 AND f.tagged ISNULL) AS untaged FROM blog_urls AS b ORDER BY total ASC, invalid ASC')
     connection.commit()
 
 
@@ -170,9 +171,10 @@ class Spider(Thread):
                 self.queue.task_done()
             return
 
-    def set_start_url(self, url):
+    def set_start_url(self, url_id, url):
         self.URLs = set()
         self.start_url = url
+	self.start_url_id = url_id
         self.URLs.add(url)
         self._links_to_process = [(url, 0)]
 
@@ -188,22 +190,22 @@ class Spider(Thread):
             [("INSERT INTO blog_urls (url) VALUES (?)", (self.start_url,))]))
 
     def insert_file_url(self, url, downloaded=False):
-        row = execSQL(DbCmd(
-            SqlCmd,
+        row = execSQL(DbCmd(SqlCmd,
             [("SELECT * FROM file_urls WHERE url = ?", (url,))]))
         if row:
             print "T%s: file already added" % self.thread
             return
-        execSQL(DbCmd(
-            SqlCmd,
-            [("INSERT INTO file_urls (blog, url, downloaded) VALUES"
-                       "(? ,?, ?)", (self.start_url, url, downloaded))]))
-    
-    def update_blog_url(self, url):
-        execSQL(DbCmd(
-            SqlCmd,
-            [("UPDATE blog_urls SET updated = DATETIME('now')  WHERE url = ?",
-            (url,))]))
+        execSQL(DbCmd(SqlCmd,
+            [("INSERT INTO file_urls (blog_id, url, downloaded) VALUES"
+	      "(? ,?, ?)", (self.start_url_id, url, downloaded))]))
+	execSQL(DbCmd(SqlCmd,
+            [("UPDATE blog_urls SET last_seen = DATETIME('now') WHERE blog_id = ?",
+	      (self.start_url_id,))]))
+        
+    def update_blog_url(self):
+        execSQL(DbCmd(SqlCmd,
+            [("UPDATE blog_urls SET updated = DATETIME('now')  WHERE blog_id = ?",
+            (self.start_url_id,))]))
         
     def url_exists(self, url):
         for alt in alternate_urls(url):
@@ -220,8 +222,8 @@ class Spider(Thread):
     def process_url(self, start_url):
         #process list of URLs one at a time
         print "STARTING T%s, maxdepth %s" % (self.thread, self.max_depth)
-        self.update_blog_url(start_url)
-        self.set_start_url(start_url)
+	self.set_start_url(*start_url)
+        self.update_blog_url()
         while self._links_to_process:
             url, url_depth = self._links_to_process.pop()
             self.log("T%s: Retrieving: %s - %s " % (
@@ -271,9 +273,7 @@ class Spider(Thread):
         print "T%s: %s" % (self.thread, url_ascii)
         if not url.startswith("http://") and not url.startswith("https://"):
             print "T%s: weird link %s" % (self.thread, url_ascii)
-            execSQL(DbCmd(
-                SqlCmd,
-                [("UPDATE file_urls SET downloaded = 1 WHERE url = ?" , (url,))]))
+	    self.downloaded_file_url(url)
             return
         for alt in alternate_urls(url):
             if os.path.exists(url_to_filename(alt)):
@@ -295,13 +295,11 @@ def get_blog_urls():
     year = last_week.year
     month = last_week.month
     day = last_week.day
-    url_tups = execSQL(
-        DbCmd(SqlCmd, [
-        ("SELECT url FROM blog_urls WHERE updated < '%04d-%02d-%02d' AND banned ISNULL ORDER BY updated;" % (year, month, day),
+    urls = execSQL(DbCmd(SqlCmd, [
+        ("SELECT blog_id, url FROM blog_urls WHERE updated < '%04d-%02d-%02d' AND banned ISNULL ORDER BY updated;" % (year, month, day),
          ())]))
-    result = [tup[0] for tup in url_tups]
-    print "%s blogs to harvest" % str(len(result))
-    return result
+    print "%s blogs to harvest" % str(len(urls))
+    return urls
     
 def download_files(n=100):
     """Download some files.
@@ -384,7 +382,7 @@ def add_blog(url):
 def list_blogs():
     connection = sqlite3.connect(configuration.database)
     cursor = connection.cursor()
-    cursor.execute("SELECT b.url, (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog = b.url), (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog = b.url AND f.invalid = 1 AND f.duplicate ISNULL), (SELECT COUNT(*) FROM file_urls AS f WHERE f.blog = b.url AND f.invalid ISNULL AND f.downloaded = 1 AND f.tagged ISNULL) FROM blog_urls AS b")
+    cursor.execute("SELECT * FROM blog_stats")
     entries = cursor.fetchall()
     for entry in entries:
 	url, nb_file, nb_invalid, nb_notagged = entry
